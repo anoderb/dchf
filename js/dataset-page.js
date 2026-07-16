@@ -7,10 +7,11 @@ import { SmartFilter } from './smart-filter.js';
 import { checkQuality } from './quality-check.js';
 import { processImage } from './image-processing.js';
 import { UploadQueue } from './upload-queue.js';
-import { deletePhoto } from './upload.js';
+import { deletePhoto, syncDatasetToHF } from './upload.js';
 import { downloadDatasetZip } from './download.js';
 import { showConfirm } from './confirm.js';
 import { showToast } from './toast.js';
+import { HF_REPO } from './config.js';
 
 // Parameter URL
 const urlParams = new URLSearchParams(window.location.search);
@@ -51,6 +52,7 @@ const checkSyncBtn = document.getElementById('check-sync-btn');
 const syncStatusPanel = document.getElementById('sync-status-panel');
 const syncStatusDetails = document.getElementById('sync-status-details');
 const repairSyncBtn = document.getElementById('repair-sync-btn');
+const syncHfBtn = document.getElementById('sync-hf-btn');
 
 // Selection Elements
 const toggleSelectModeBtn = document.getElementById('toggle-select-mode-btn');
@@ -176,6 +178,11 @@ async function initPage() {
     return;
   }
 
+  // Sembunyikan tombol sinkronisasi jika HF tidak dikonfigurasi
+  if (!HF_REPO && syncHfBtn) {
+    syncHfBtn.classList.add('d-none');
+  }
+
   // Tampilkan info dataset di header
   datasetTitleDisplay.textContent = datasetName || datasetSlug;
   datasetSubtitleDisplay.textContent = 'Memuat foto-foto produk...';
@@ -272,11 +279,26 @@ function setupEventListeners() {
   });
 
   // Listener event upload selesai untuk sinkronisasi list secara real-time
-  window.addEventListener('photo-uploaded', (e) => {
+  window.addEventListener('photo-uploaded', async (e) => {
     const newRecord = e.detail;
     if (!datasetPhotos.some(p => p.id === newRecord.id)) {
       datasetPhotos.push(newRecord);
       renderGallery();
+    }
+
+    // Auto-Sync pemicu otomatis jika jumlah foto lokal (Supabase) >= 10
+    const unsyncedCount = datasetPhotos.filter(p => p.storage_provider === 'supabase').length;
+    if (unsyncedCount >= 10) {
+      console.log(`Pemicu otomatis: ${unsyncedCount} foto lokal terdeteksi. Memulai auto-sync batch ke Hugging Face...`);
+      showToast('Pemicu Otomatis: 10 foto lokal terdeteksi, memindahkan ke Hugging Face...', 'info');
+      
+      try {
+        await syncDatasetToHF(datasetId, datasetSlug);
+        await loadPhotos();
+        showToast('Auto-sync ke Hugging Face selesai!', 'success');
+      } catch (err) {
+        console.warn('Gagal melakukan auto-sync otomatis:', err);
+      }
     }
   });
 
@@ -293,6 +315,9 @@ function setupEventListeners() {
   // Listener Sinkronisasi Data
   checkSyncBtn.addEventListener('click', handleCheckSync);
   repairSyncBtn.addEventListener('click', handleRepairSync);
+  if (syncHfBtn) {
+    syncHfBtn.addEventListener('click', handleSyncHF);
+  }
 
   // Listener Seleksi Foto
   toggleSelectModeBtn.addEventListener('click', enterSelectMode);
@@ -1032,14 +1057,19 @@ function renderGallery() {
 
     // Ambil path thumbnail yang seragam (thumbnails/filename)
     const thumbnailPath = photo.storage_path.replace(/([^/]+)$/, 'thumbnails/$1');
-    const thumbUrl = getPhotoPublicUrl(thumbnailPath);
+    const thumbUrl = getPhotoPublicUrl({ ...photo, storage_path: thumbnailPath });
 
     // Ambil path foto utama sebagai fallback jika thumbnail gagal dimuat
-    const mainUrl = getPhotoPublicUrl(photo.storage_path);
+    const mainUrl = getPhotoPublicUrl(photo);
       
     const sizeKB = photo.file_size ? `${(photo.file_size / 1024).toFixed(0)}KB` : '';
+    const provider = photo.storage_provider || 'supabase';
+    const providerBadge = provider === 'huggingface'
+      ? '<span class="provider-badge hf" style="position: absolute; top: 8px; left: 8px; background: rgba(16, 185, 129, 0.95); color: white; padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: bold; z-index: 5;">HF</span>'
+      : '<span class="provider-badge supabase" style="position: absolute; top: 8px; left: 8px; background: rgba(245, 158, 11, 0.95); color: white; padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: bold; z-index: 5;">Local</span>';
 
     card.innerHTML = `
+      ${providerBadge}
       <img src="${thumbUrl}" alt="${photo.file_name}" loading="lazy" onerror="this.onerror=null; this.src='${mainUrl}';">
       <div class="select-indicator"></div>
       <button class="photo-delete-btn" title="Hapus foto" aria-label="Hapus foto">
@@ -1229,6 +1259,63 @@ async function handleRepairSync() {
     repairSyncBtn.innerHTML = 'Sinkronkan Sekarang';
   }
 }
+
+async function handleSyncHF() {
+  if (syncHfBtn.disabled) return;
+
+  // Cek apakah ada foto yang butuh disinkronisasi
+  const unsyncedPhotos = datasetPhotos.filter(p => p.storage_provider === 'supabase');
+  if (unsyncedPhotos.length === 0) {
+    showToast('Semua foto sudah tersinkronisasi di Hugging Face.', 'info');
+    return;
+  }
+
+  const confirmed = await showConfirm({
+    title: 'Sinkronisasi Hugging Face',
+    message: `Apakah Anda yakin ingin memindahkan seluruh (${unsyncedPhotos.length}) foto di Supabase Storage ke repositori Hugging Face dalam satu komit batch?<br><br>Tindakan ini akan mengosongkan penyimpanan Supabase Anda secara aman.`,
+    confirmText: 'Mulai Sinkronisasi',
+    isDanger: false
+  });
+
+  if (!confirmed) return;
+
+  syncHfBtn.disabled = true;
+  syncHfBtn.innerHTML = '⏳ Sinkronisasi...';
+
+  // Tampilkan progress panel
+  initProgressPanel(unsyncedPhotos.length);
+  updateProgressPercent(0, unsyncedPhotos.length);
+  updateStepIndicator('extract', 'running');
+  updateStepIndicator('process', 'running');
+  updateStepIndicator('compress', 'running');
+  updateStepIndicator('upload', 'running');
+
+  try {
+    const result = await syncDatasetToHF(datasetId, datasetSlug, (current, total, statusText) => {
+      updateProgressPercent(current, total);
+      progressStatusText.textContent = statusText;
+    });
+
+    updateStepIndicator('verification', 'done');
+    completeProgressPanel();
+
+    if (result.syncedCount > 0) {
+      showToast(`🎉 Sukses mensinkronkan ${result.syncedCount} foto ke Hugging Face!`, 'success');
+      // Reload daftar foto
+      await loadPhotos();
+    } else {
+      showToast('Semua foto sudah tersinkronisasi di Hugging Face.', 'info');
+    }
+  } catch (err) {
+    console.error(err);
+    showToast(`Gagal sinkronisasi ke HF: ${err.message}`, 'error');
+  } finally {
+    progressPanel.classList.add('d-none');
+    syncHfBtn.disabled = false;
+    syncHfBtn.innerHTML = '☁️ Sinkronkan ke HF';
+  }
+}
+
 
 /* ==========================================================================
    FITUR SELEKSI MULTIPEL & HAPUS MASSAL (BULK DELETE)

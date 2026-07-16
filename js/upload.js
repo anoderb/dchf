@@ -1,4 +1,4 @@
-import { supabase, addPhotoRecord, deletePhotoRecord, getPhotos, updateDatasetPhotoCount, getPhotoPublicUrl } from './supabase.js';
+import { supabase, addPhotoRecord, deletePhotoRecord, getPhotos, updateDatasetPhotoCount, getPhotoPublicUrl, getUnsyncedPhotos, updatePhotosToSynced } from './supabase.js';
 import { HF_TOKEN, HF_REPO } from './config.js';
 
 // In-memory cache untuk menyimpan index sequence terakhir dari dataset aktif
@@ -59,7 +59,7 @@ export async function getNextFileName(datasetId, datasetSlug) {
 }
 
 /**
- * Mengunggah satu foto terproses dan thumbnail terkait ke Storage (Supabase/HF),
+ * Mengunggah satu foto terproses dan thumbnail terkait ke Supabase Storage (Buffer Sementara),
  * serta menambahkan catatan metadatanya ke database PostgreSQL.
  */
 export async function uploadSinglePhoto({ datasetId, datasetSlug, processedBlob, thumbnail, width, height, fileName }) {
@@ -70,71 +70,31 @@ export async function uploadSinglePhoto({ datasetId, datasetSlug, processedBlob,
     finalFileName = fileInfo.fileName;
   }
 
-  // Path tujuan penyimpanan
-  const storagePath = HF_REPO 
-    ? `data/${datasetSlug}/${finalFileName}` 
-    : `${datasetSlug}/${finalFileName}`;
-  const thumbnailPath = HF_REPO 
-    ? `data/${datasetSlug}/thumbnails/${finalFileName}` 
-    : `${datasetSlug}/thumbnails/${finalFileName}`;
+  // Path tujuan penyimpanan sementara di Supabase Storage
+  const storagePath = `${datasetSlug}/${finalFileName}`;
+  const thumbnailPath = `${datasetSlug}/thumbnails/${finalFileName}`;
 
-  if (HF_REPO) {
-    // 1. Upload ke Hugging Face Dataset
-    const { uploadFile } = await import('@huggingface/hub');
+  // 1. Upload ke Supabase Storage
+  const { error: storageError } = await supabase.storage
+    .from('dataset-photos')
+    .upload(storagePath, processedBlob, {
+      contentType: 'image/jpeg',
+      upsert: true
+    });
+
+  if (storageError) throw storageError;
+
+  // 2. Upload thumbnail ke Supabase Storage
+  if (thumbnail) {
     try {
-      await uploadFile({
-        repo: HF_REPO,
-        repoType: 'dataset',
-        credentials: { accessToken: HF_TOKEN },
-        accessToken: HF_TOKEN,
-        file: {
-          path: storagePath,
-          content: processedBlob
-        }
-      });
-
-      if (thumbnail) {
-        try {
-          await uploadFile({
-            repo: HF_REPO,
-            repoType: 'dataset',
-            credentials: { accessToken: HF_TOKEN },
-            accessToken: HF_TOKEN,
-            file: {
-              path: thumbnailPath,
-              content: thumbnail
-            }
-          });
-        } catch (thumbErr) {
-          console.warn('Gagal upload thumbnail ke Hugging Face, melanjutkan...', thumbErr);
-        }
-      }
-    } catch (hfError) {
-      throw new Error(`Gagal mengunggah ke Hugging Face: ${hfError.message}`);
-    }
-  } else {
-    // 1. Upload ke Supabase Storage
-    const { error: storageError } = await supabase.storage
-      .from('dataset-photos')
-      .upload(storagePath, processedBlob, {
-        contentType: 'image/jpeg',
-        upsert: true
-      });
-
-    if (storageError) throw storageError;
-
-    // 2. Upload thumbnail ke Supabase Storage
-    if (thumbnail) {
-      try {
-        await supabase.storage
-          .from('dataset-photos')
-          .upload(thumbnailPath, thumbnail, {
-            contentType: 'image/jpeg',
-            upsert: true
-          });
-      } catch (thumbErr) {
-        console.warn('Gagal upload thumbnail ke Supabase, melanjutkan.', thumbErr);
-      }
+      await supabase.storage
+        .from('dataset-photos')
+        .upload(thumbnailPath, thumbnail, {
+          contentType: 'image/jpeg',
+          upsert: true
+        });
+    } catch (thumbErr) {
+      console.warn('Gagal upload thumbnail ke Supabase, melanjutkan.', thumbErr);
     }
   }
 
@@ -146,7 +106,8 @@ export async function uploadSinglePhoto({ datasetId, datasetSlug, processedBlob,
       storagePath,
       fileSize: processedBlob.size,
       width,
-      height
+      height,
+      storageProvider: 'supabase' // Penanda berada di Supabase (Buffer)
     });
 
     // 4. Update photo_count di tabel datasets secara sinkron
@@ -154,8 +115,8 @@ export async function uploadSinglePhoto({ datasetId, datasetSlug, processedBlob,
     await updateDatasetPhotoCount(datasetId, photos.length);
 
     // Dapatkan URL Publik
-    const publicUrl = getPhotoPublicUrl(storagePath);
-    const thumbnailUrl = getPhotoPublicUrl(thumbnailPath);
+    const publicUrl = getPhotoPublicUrl(dbRecord);
+    const thumbnailUrl = getPhotoPublicUrl({ ...dbRecord, storage_path: thumbnailPath });
 
     return {
       ...dbRecord,
@@ -164,28 +125,10 @@ export async function uploadSinglePhoto({ datasetId, datasetSlug, processedBlob,
     };
   } catch (dbError) {
     // Rollback file storage jika database insert gagal
-    if (HF_REPO) {
-      const { deleteFile } = await import('@huggingface/hub');
-      try {
-        await deleteFile({
-          repo: HF_REPO,
-          repoType: 'dataset',
-          credentials: { accessToken: HF_TOKEN },
-          accessToken: HF_TOKEN,
-          path: storagePath
-        });
-        await deleteFile({
-          repo: HF_REPO,
-          repoType: 'dataset',
-          credentials: { accessToken: HF_TOKEN },
-          accessToken: HF_TOKEN,
-          path: thumbnailPath
-        });
-      } catch (err) {
-        console.warn('Gagal melakukan rollback file di Hugging Face:', err);
-      }
-    } else {
+    try {
       await supabase.storage.from('dataset-photos').remove([storagePath, thumbnailPath]);
+    } catch (rollbackErr) {
+      console.error('Gagal rollback file buffer Supabase:', rollbackErr);
     }
     throw dbError;
   }
@@ -195,28 +138,30 @@ export async function uploadSinglePhoto({ datasetId, datasetSlug, processedBlob,
  * Menghapus foto dari Storage (Supabase/HF) dan database PostgreSQL
  */
 export async function deletePhoto(photoId, storagePath) {
-  // Dapatkan detail record foto terlebih dahulu untuk mengetahui dataset_id
+  // Dapatkan detail record foto terlebih dahulu untuk mengetahui dataset_id dan storage_provider
   let datasetId = null;
+  let storageProvider = 'supabase';
   try {
     const { data } = await supabase
       .from('photos_hf')
-      .select('dataset_id')
+      .select('dataset_id, storage_provider')
       .eq('id', photoId)
       .single();
     if (data) {
       datasetId = data.dataset_id;
+      storageProvider = data.storage_provider || 'supabase';
     }
   } catch (e) {
-    console.warn('Gagal mendapatkan dataset_id dari photo record.', e);
+    console.warn('Gagal mendapatkan record foto untuk deletePhoto.', e);
   }
 
   // 1. Hapus catatan di database
   await deletePhotoRecord(photoId);
 
-  // 2. Hapus file fisik dan thumbnail dari Storage
+  // 2. Hapus file fisik dan thumbnail dari Storage yang sesuai
   const thumbnailPath = storagePath.replace(/([^/]+)$/, 'thumbnails/$1');
   
-  if (HF_REPO) {
+  if (storageProvider === 'huggingface' && HF_REPO) {
     const { deleteFile } = await import('@huggingface/hub');
     try {
       await deleteFile({
@@ -237,12 +182,13 @@ export async function deletePhoto(photoId, storagePath) {
       console.error(`Gagal menghapus file dari Hugging Face: ${storagePath}`, e);
     }
   } else {
+    // Hapus dari Supabase Storage
     const { error: storageError } = await supabase.storage
       .from('dataset-photos')
       .remove([storagePath, thumbnailPath]);
 
     if (storageError) {
-      console.error(`Gagal menghapus file storage: ${storagePath}`, storageError);
+      console.error(`Gagal menghapus file storage Supabase: ${storagePath}`, storageError);
     }
   }
 
@@ -259,3 +205,112 @@ export async function deletePhoto(photoId, storagePath) {
   return true;
 }
 
+/**
+ * Mensinkronisasi semua foto yang ada di Supabase buffer ke Hugging Face dalam satu commit
+ * @param {string} datasetId - ID dataset
+ * @param {string} datasetSlug - Slug dataset
+ * @param {Function} onProgress - Callback progress: (current, total, statusText) => void
+ */
+export async function syncDatasetToHF(datasetId, datasetSlug, onProgress) {
+  if (!HF_REPO) {
+    throw new Error('Konfigurasi Hugging Face (VITE_HF_REPO) tidak ditemukan.');
+  }
+
+  // 1. Ambil foto yang belum tersinkronisasi
+  const unsyncedPhotos = await getUnsyncedPhotos(datasetId);
+  if (!unsyncedPhotos || unsyncedPhotos.length === 0) {
+    return { syncedCount: 0 };
+  }
+
+  const filesToCommit = [];
+  const dbUpdates = [];
+  const supabasePathsToDelete = [];
+  const total = unsyncedPhotos.length;
+
+  // 2. Download blob foto buffer dari Supabase Storage secara paralel/sekuensial
+  for (let i = 0; i < total; i++) {
+    const photo = unsyncedPhotos[i];
+    if (onProgress) {
+      onProgress(i, total, `Mengunduh berkas buffer Supabase: ${photo.file_name} (${i + 1}/${total})`);
+    }
+
+    try {
+      // Download gambar utama
+      const { data: mainBlob, error: mainErr } = await supabase.storage
+        .from('dataset-photos')
+        .download(photo.storage_path);
+      
+      if (mainErr) throw mainErr;
+
+      // Download thumbnail
+      const thumbPath = photo.storage_path.replace(/([^/]+)$/, 'thumbnails/$1');
+      const { data: thumbBlob } = await supabase.storage
+        .from('dataset-photos')
+        .download(thumbPath);
+
+      // Definisikan target path di Hugging Face
+      const targetPath = `data/${datasetSlug}/${photo.file_name}`;
+      const targetThumbPath = `data/${datasetSlug}/thumbnails/${photo.file_name}`;
+
+      filesToCommit.push({
+        path: targetPath,
+        content: mainBlob
+      });
+
+      if (thumbBlob) {
+        filesToCommit.push({
+          path: targetThumbPath,
+          content: thumbBlob
+        });
+      }
+
+      dbUpdates.push({
+        id: photo.id,
+        storage_provider: 'huggingface',
+        storage_path: targetPath
+      });
+
+      supabasePathsToDelete.push(photo.storage_path, thumbPath);
+    } catch (err) {
+      console.error(`Gagal memproses file ${photo.file_name} untuk sinkronisasi:`, err);
+    }
+  }
+
+  if (filesToCommit.length === 0) {
+    throw new Error('Tidak ada file buffer yang berhasil diunduh untuk disinkronkan.');
+  }
+
+  // 3. Kirim komit batch tunggal ke Hugging Face
+  if (onProgress) {
+    onProgress(total, total, `Mengirimkan komit batch ke Hugging Face...`);
+  }
+
+  const { uploadFiles } = await import('@huggingface/hub');
+  await uploadFiles({
+    repo: HF_REPO,
+    credentials: { accessToken: HF_TOKEN },
+    accessToken: HF_TOKEN,
+    files: filesToCommit,
+    commitTitle: `Sinkronisasi batch dataset ${datasetSlug} (${dbUpdates.length} foto)`
+  });
+
+  // 4. Update status record di Supabase DB ke Hugging Face
+  if (onProgress) {
+    onProgress(total, total, `Memperbarui status database...`);
+  }
+  await updatePhotosToSynced(dbUpdates);
+
+  // 5. Hapus file buffer di Supabase Storage
+  if (onProgress) {
+    onProgress(total, total, `Membersihkan file buffer Supabase...`);
+  }
+  try {
+    await supabase.storage
+      .from('dataset-photos')
+      .remove(supabasePathsToDelete);
+  } catch (cleanErr) {
+    console.warn('Gagal membersihkan file buffer di Supabase Storage:', cleanErr);
+  }
+
+  return { syncedCount: dbUpdates.length };
+}

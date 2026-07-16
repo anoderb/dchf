@@ -5,22 +5,23 @@ import { HF_REPO } from './config.js';
 /**
  * Mengunduh file dari Storage (Supabase/HF) sebagai Blob
  */
-async function downloadPhotoBlob(storagePath) {
-  if (HF_REPO) {
-    const url = getPhotoPublicUrl(storagePath);
+async function downloadPhotoBlob(photo) {
+  const provider = photo.storage_provider || 'supabase';
+  if (provider === 'huggingface' && HF_REPO) {
+    const url = getPhotoPublicUrl(photo);
     const response = await fetch(url);
     if (!response.ok) {
-      throw new Error(`Gagal mengunduh file ${storagePath} dari Hugging Face: ${response.status} ${response.statusText}`);
+      throw new Error(`Gagal mengunduh file ${photo.file_name} dari Hugging Face: ${response.status} ${response.statusText}`);
     }
     return await response.blob();
   }
 
   const { data, error } = await supabase.storage
     .from('dataset-photos')
-    .download(storagePath);
+    .download(photo.storage_path);
 
   if (error) {
-    throw new Error(`Gagal mengunduh file ${storagePath}: ${error.message}`);
+    throw new Error(`Gagal mengunduh file ${photo.file_name}: ${error.message}`);
   }
   return data;
 }
@@ -60,7 +61,7 @@ export async function downloadDatasetZip(dataset, onProgress) {
     const photo = photos[i];
     
     try {
-      const blob = await downloadPhotoBlob(photo.storage_path);
+      const blob = await downloadPhotoBlob(photo);
       zip.file(photo.file_name, blob);
       downloadedCount++;
     } catch (err) {
@@ -118,7 +119,7 @@ export async function downloadAllDatasetsZip(datasets, onProgress) {
       processedCount++;
       
       try {
-        const blob = await downloadPhotoBlob(photo.storage_path);
+        const blob = await downloadPhotoBlob(photo);
         folder.file(photo.file_name, blob);
         downloadedCount++;
       } catch (err) {

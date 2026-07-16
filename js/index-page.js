@@ -48,7 +48,7 @@ async function loadData() {
           let thumbnailUrl = null;
           if (latestPhoto) {
             // Ambil public url dari storage
-            thumbnailUrl = getPhotoPublicUrl(latestPhoto.storage_path);
+            thumbnailUrl = getPhotoPublicUrl(latestPhoto);
           }
           return { ...dataset, thumbnailUrl };
         } catch (e) {

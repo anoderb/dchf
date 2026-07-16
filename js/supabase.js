@@ -6,18 +6,23 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 /**
  * Menyelesaikan URL publik foto secara dinamis (Supabase atau Hugging Face)
+ * @param {object} photo - Record objek foto dari database
  */
-export function getPhotoPublicUrl(storagePath) {
-  if (HF_REPO) {
+export function getPhotoPublicUrl(photo) {
+  if (!photo) return '';
+  
+  const provider = photo.storage_provider || 'supabase';
+  
+  if (provider === 'huggingface' && HF_REPO) {
     // Gunakan HF_REPO_ID (tanpa prefix 'datasets/') untuk konstruksi URL
     const hfBaseUrl = `https://huggingface.co/datasets/${HF_REPO_ID}/resolve/main/`;
     const tokenQuery = HF_TOKEN ? `?token=${HF_TOKEN}` : '';
-    return `${hfBaseUrl}${storagePath}${tokenQuery}`;
+    return `${hfBaseUrl}${photo.storage_path}${tokenQuery}`;
   }
   
   const { data } = supabase.storage
     .from('dataset-photos')
-    .getPublicUrl(storagePath);
+    .getPublicUrl(photo.storage_path);
   return data?.publicUrl;
 }
 
@@ -124,7 +129,7 @@ export async function getLatestPhoto(datasetId) {
 /**
  * Menyimpan data metadata foto baru ke database
  */
-export async function addPhotoRecord({ datasetId, fileName, storagePath, fileSize, width, height }) {
+export async function addPhotoRecord({ datasetId, fileName, storagePath, fileSize, width, height, storageProvider = 'supabase' }) {
   const { data, error } = await supabase
     .from('photos_hf')
     .insert([
@@ -134,7 +139,8 @@ export async function addPhotoRecord({ datasetId, fileName, storagePath, fileSiz
         storage_path: storagePath,
         file_size: fileSize,
         width,
-        height
+        height,
+        storage_provider: storageProvider
       }
     ])
     .select()
@@ -328,4 +334,32 @@ export async function repairDatasetSync(datasetId, datasetSlug, syncData) {
   
   return updatedPhotos;
 }
+
+/**
+ * Mengambil daftar foto yang belum disinkronkan ke Hugging Face (masih di Supabase)
+ */
+export async function getUnsyncedPhotos(datasetId) {
+  const { data, error } = await supabase
+    .from('photos_hf')
+    .select('*')
+    .eq('dataset_id', datasetId)
+    .eq('storage_provider', 'supabase');
+
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Melakukan update massal (upsert) untuk mengubah status sinkronisasi foto ke Hugging Face
+ */
+export async function updatePhotosToSynced(updates) {
+  const { data, error } = await supabase
+    .from('photos_hf')
+    .upsert(updates)
+    .select();
+
+  if (error) throw error;
+  return data;
+}
+
 
