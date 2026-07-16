@@ -286,11 +286,11 @@ function setupEventListeners() {
       renderGallery();
     }
 
-    // Auto-Sync pemicu otomatis jika jumlah foto lokal (Supabase) >= 10
+    // Auto-Sync pemicu otomatis jika jumlah foto lokal (Supabase) >= 2000
     const unsyncedCount = datasetPhotos.filter(p => p.storage_provider === 'supabase').length;
-    if (unsyncedCount >= 10) {
+    if (unsyncedCount >= 2000) {
       console.log(`Pemicu otomatis: ${unsyncedCount} foto lokal terdeteksi. Memulai auto-sync batch ke Hugging Face...`);
-      showToast('Pemicu Otomatis: 10 foto lokal terdeteksi, memindahkan ke Hugging Face...', 'info');
+      showToast('Pemicu Otomatis: 2000 foto lokal terdeteksi, memindahkan ke Hugging Face...', 'info');
       
       try {
         await syncDatasetToHF(datasetId, datasetSlug);
