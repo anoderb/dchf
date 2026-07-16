@@ -712,7 +712,7 @@ select.form-control {
   top: 0;
   left: 0;
   width: 100%;
-  padding: 16px;
+  padding: calc(16px + env(safe-area-inset-top, 0px)) 16px 16px 16px;
   background: linear-gradient(rgba(0,0,0,0.8), transparent);
   display: flex;
   justify-content: space-between;
@@ -725,13 +725,20 @@ select.form-control {
   bottom: 0;
   left: 0;
   width: 100%;
-  padding: 24px;
+  padding: 24px 24px calc(24px + env(safe-area-inset-bottom, 0px)) 24px;
   background: linear-gradient(transparent, rgba(0,0,0,0.85));
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 16px;
   z-index: 1010;
+}
+
+/* Ensure the camera preview container fills 100% of the backdrop in fullscreen mode */
+.camera-fullscreen-backdrop .camera-container {
+  height: 100% !important;
+  max-height: none !important;
+  aspect-ratio: auto !important;
 }
 
 .shutter-controls {
