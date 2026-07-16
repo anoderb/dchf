@@ -265,7 +265,7 @@ export async function syncDatasetToHF(datasetId, datasetSlug, onProgress) {
       }
 
       dbUpdates.push({
-        id: photo.id,
+        ...photo,
         storage_provider: 'huggingface',
         storage_path: targetPath
       });
