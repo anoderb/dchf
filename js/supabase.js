@@ -184,12 +184,50 @@ export async function updateDatasetPhotoCount(datasetId, count) {
 export async function checkDatasetSync(datasetId, datasetSlug) {
   // 1. Ambil semua data foto dari database
   const dbPhotos = await getPhotos(datasetId);
+  const dbNames = new Set(dbPhotos.map(p => p.file_name));
   
-  let mainFiles = [];
-  let thumbFiles = [];
+  let mainFiles = []; // { name: string, provider: 'supabase' | 'huggingface', path: string }
+  let thumbFiles = []; // { name: string, provider: 'supabase' | 'huggingface', path: string }
 
+  // 2. Ambil daftar file dari Supabase Storage
+  try {
+    const { data: storageFiles, error: storageErr } = await supabase.storage
+      .from('dataset-photos')
+      .list(datasetSlug, { limit: 1000 });
+      
+    if (!storageErr && storageFiles) {
+      storageFiles.forEach(f => {
+        if (f.metadata && f.name !== 'thumbnails') {
+          mainFiles.push({
+            name: f.name,
+            provider: 'supabase',
+            path: `${datasetSlug}/${f.name}`
+          });
+        }
+      });
+    }
+
+    const { data: thumbnailFiles, error: thumbErr } = await supabase.storage
+      .from('dataset-photos')
+      .list(`${datasetSlug}/thumbnails`, { limit: 1000 });
+      
+    if (!thumbErr && thumbnailFiles) {
+      thumbnailFiles.forEach(f => {
+        if (f.metadata) {
+          thumbFiles.push({
+            name: f.name,
+            provider: 'supabase',
+            path: `${datasetSlug}/thumbnails/${f.name}`
+          });
+        }
+      });
+    }
+  } catch (e) {
+    console.warn('Gagal membaca daftar file dari Supabase Storage:', e);
+  }
+
+  // 3. Ambil daftar file dari Hugging Face (jika dikonfigurasi)
   if (HF_REPO) {
-    // List files dari Hugging Face Repository
     const { listFiles } = await import('@huggingface/hub');
     try {
       const folderPath = `data/${datasetSlug}`;
@@ -204,9 +242,17 @@ export async function checkDatasetSync(datasetId, datasetSlug) {
           const fileName = file.path.split('/').pop();
           if (file.type === 'file' || file.type === undefined) {
             if (file.path.includes('/thumbnails/')) {
-              thumbFiles.push({ name: fileName });
+              thumbFiles.push({
+                name: fileName,
+                provider: 'huggingface',
+                path: file.path
+              });
             } else if (!file.path.endsWith('/')) {
-              mainFiles.push({ name: fileName });
+              mainFiles.push({
+                name: fileName,
+                provider: 'huggingface',
+                path: file.path
+              });
             }
           }
         }
@@ -214,44 +260,25 @@ export async function checkDatasetSync(datasetId, datasetSlug) {
     } catch (e) {
       console.warn('Gagal membaca daftar file dari Hugging Face:', e);
     }
-  } else {
-    // 2. Ambil daftar file utama di folder storage Supabase
-    const { data: storageFiles, error: storageErr } = await supabase.storage
-      .from('dataset-photos')
-      .list(datasetSlug, { limit: 1000 });
-      
-    if (storageErr) throw storageErr;
-    
-    mainFiles = (storageFiles || []).filter(f => f.metadata && f.name !== 'thumbnails');
-    
-    // 3. Ambil daftar file di folder thumbnails Supabase
-    const { data: thumbnailFiles, error: thumbErr } = await supabase.storage
-      .from('dataset-photos')
-      .list(`${datasetSlug}/thumbnails`, { limit: 1000 });
-      
-    if (thumbErr) throw thumbErr;
-    
-    thumbFiles = (thumbnailFiles || []).filter(f => f.metadata);
   }
 
-  // Kalkulasi selisih data
-  const dbNames = new Set(dbPhotos.map(p => p.file_name));
+  // 4. Kalkulasi selisih data
   const mainFileNames = new Set(mainFiles.map(f => f.name));
   
-  // Record di database yang filenya tidak ada di storage
+  // Record di database yang filenya tidak ada di storage mana pun (Supabase maupun HF)
   const missingInStorage = dbPhotos.filter(p => !mainFileNames.has(p.file_name));
   
   // File di storage utama yang tidak memiliki record di database
   const orphansInStorage = mainFiles
     .filter(f => !dbNames.has(f.name))
-    .map(f => HF_REPO ? `data/${datasetSlug}/${f.name}` : `${datasetSlug}/${f.name}`);
+    .map(f => ({ path: f.path, provider: f.provider }));
   
   // File di storage thumbnails yang tidak memiliki record di database
   const orphansInThumbnails = thumbFiles
     .filter(f => !dbNames.has(f.name))
-    .map(f => HF_REPO ? `data/${datasetSlug}/thumbnails/${f.name}` : `${datasetSlug}/thumbnails/${f.name}`);
+    .map(f => ({ path: f.path, provider: f.provider }));
 
-  // Cari record duplikat di database (file_name yang sama muncul lebih dari sekali)
+  // Cari record duplikat di database
   const nameGroups = {};
   const duplicateDbRecords = [];
   
@@ -265,7 +292,6 @@ export async function checkDatasetSync(datasetId, datasetSlug) {
   Object.keys(nameGroups).forEach(name => {
     const group = nameGroups[name];
     if (group.length > 1) {
-      // Simpan record tambahan sebagai duplikat, kecuali yang pertama (index 0)
       for (let i = 1; i < group.length; i++) {
         duplicateDbRecords.push(group[i]);
       }
@@ -288,7 +314,7 @@ export async function checkDatasetSync(datasetId, datasetSlug) {
  * Melakukan perbaikan sinkronisasi database dan storage
  */
 export async function repairDatasetSync(datasetId, datasetSlug, syncData) {
-  // 1. Hapus record database yang tidak ada file fisiknya
+  // 1. Hapus record database yang tidak ada file fisiknya di storage mana pun
   for (const record of syncData.missingInStorage) {
     await deletePhotoRecord(record.id);
   }
@@ -300,30 +326,29 @@ export async function repairDatasetSync(datasetId, datasetSlug, syncData) {
     }
   }
   
-  // 3. Hapus file fisik dan thumbnail dari storage yang tidak punya record di database
-  const filesToDelete = [...syncData.orphansInStorage, ...syncData.orphansInThumbnails];
-  if (filesToDelete.length > 0) {
-    if (HF_REPO) {
+  // 3. Hapus file fisik dan thumbnail dari storage masing-masing yang tidak punya record di database
+  const orphans = [...syncData.orphansInStorage, ...syncData.orphansInThumbnails];
+  for (const orphan of orphans) {
+    if (orphan.provider === 'huggingface' && HF_REPO) {
       const { deleteFile } = await import('@huggingface/hub');
-      for (const filePath of filesToDelete) {
-        try {
-          await deleteFile({
-            repo: HF_REPO,
-            repoType: 'dataset',
-            credentials: { accessToken: HF_TOKEN },
-            accessToken: HF_TOKEN,
-            path: filePath
-          });
-        } catch (e) {
-          console.warn(`Gagal menghapus file ${filePath} di Hugging Face:`, e);
-        }
+      try {
+        await deleteFile({
+          repo: HF_REPO,
+          repoType: 'dataset',
+          credentials: { accessToken: HF_TOKEN },
+          accessToken: HF_TOKEN,
+          path: orphan.path
+        });
+      } catch (e) {
+        console.warn(`Gagal menghapus orphan ${orphan.path} di Hugging Face:`, e);
       }
     } else {
+      // Hapus dari Supabase Storage
       const { error: deleteErr } = await supabase.storage
         .from('dataset-photos')
-        .remove(filesToDelete);
+        .remove([orphan.path]);
       if (deleteErr) {
-        console.warn('Gagal menghapus beberapa file yatim dari storage:', deleteErr);
+        console.warn(`Gagal menghapus orphan ${orphan.path} di Supabase Storage:`, deleteErr);
       }
     }
   }
